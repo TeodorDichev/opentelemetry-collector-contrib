@@ -89,6 +89,14 @@ func TestConfig(t *testing.T) {
 				}(),
 			},
 			{
+				Name: "path_cache_size",
+				Expect: func() *Config {
+					cfg := NewConfig()
+					cfg.PathCacheSize = 500
+					return cfg
+				}(),
+			},
+			{
 				Name: "parse_to_attributes",
 				Expect: func() *Config {
 					p := NewConfig()

@@ -24,6 +24,9 @@ parse_to_body:
 parse_to_resource:
   type: container
   parse_to: resource
+path_cache_size:
+  type: container
+  path_cache_size: 500
 parse_to_simple:
   type: container
   parse_to: body.log

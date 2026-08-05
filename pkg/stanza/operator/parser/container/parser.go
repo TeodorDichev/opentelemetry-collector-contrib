@@ -60,6 +60,7 @@ var (
 // Parser is an operator that parses Container logs.
 type Parser struct {
 	helper.ParserOperator
+	cache                   pathCache
 	recombineParser         operator.Operator
 	format                  string
 	addMetadataFromFilepath bool
@@ -403,9 +404,15 @@ func (p *Parser) extractk8sMetaFromFilePath(e *entry.Entry) error {
 		return fmt.Errorf("type '%T' cannot be parsed as log path field", logPath)
 	}
 
-	parsedValues, err := helper.MatchValues(rawLogPath, pathMatcher)
-	if err != nil {
-		return errors.New("failed to detect a valid log path")
+	var err error
+	parsedValues, ok := p.cache.get(rawLogPath)
+	if !ok {
+		parsedValues, err = helper.MatchValues(rawLogPath, pathMatcher)
+		if err != nil {
+			return errors.New("failed to detect a valid log path")
+		}
+
+		p.cache.add(rawLogPath, parsedValues)
 	}
 
 	for originalKey, attributeKey := range k8sMetadataMapping {

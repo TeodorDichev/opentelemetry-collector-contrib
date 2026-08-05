@@ -51,6 +51,7 @@ type Config struct {
 	Format                  string          `mapstructure:"format"`
 	AddMetadataFromFilePath bool            `mapstructure:"add_metadata_from_filepath"`
 	MaxLogSize              helper.ByteSize `mapstructure:"max_log_size,omitempty"`
+	PathCacheSize           int             `mapstructure:"path_cache_size,omitempty"`
 }
 
 // Build will build a Container parser operator.
@@ -72,10 +73,19 @@ func (c Config) Build(set component.TelemetrySettings) (operator.Operator, error
 		}
 	}
 
+	cacheSize := func() int {
+		if !c.AddMetadataFromFilePath {
+			return 1 // created with minimal size
+		}
+
+		return c.PathCacheSize
+	}
+
 	p := &Parser{
 		ParserOperator:          parserOperator,
 		format:                  c.Format,
 		addMetadataFromFilepath: c.AddMetadataFromFilePath,
+		cache:                   *NewPathCache(cacheSize()),
 	}
 	var cLogEmitter helper.LogEmitter
 	if metadata.StanzaSynchronousLogEmitterFeatureGate.IsEnabled() {
