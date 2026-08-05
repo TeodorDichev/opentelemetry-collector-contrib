@@ -9,6 +9,7 @@ import (
 
 	"go.opentelemetry.io/collector/component"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/entry"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/attrs"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/internal/metadata"
@@ -23,6 +24,7 @@ const (
 	recombineSourceIdentifier = attrs.LogFilePath
 	recombineIsLastEntry      = "attributes.logtag == 'F'"
 	defaultMaxLogSize         = 1024 * 1024
+	defaultCacheSize          = 4096
 )
 
 func init() {
@@ -41,6 +43,7 @@ func NewConfigWithID(operatorID string) *Config {
 		Format:                  "",
 		AddMetadataFromFilePath: true,
 		MaxLogSize:              defaultMaxLogSize,
+		Cache:                   defaultCacheSize,
 	}
 }
 
@@ -51,6 +54,9 @@ type Config struct {
 	Format                  string          `mapstructure:"format"`
 	AddMetadataFromFilePath bool            `mapstructure:"add_metadata_from_filepath"`
 	MaxLogSize              helper.ByteSize `mapstructure:"max_log_size,omitempty"`
+
+	// ignored if AddMetadataFromFilePath is false
+	Cache int `mapstructure:"filepath_cache_size,omitempty"`
 }
 
 // Build will build a Container parser operator.
@@ -72,10 +78,23 @@ func (c Config) Build(set component.TelemetrySettings) (operator.Operator, error
 		}
 	}
 
+	cacheSize := func() int {
+		if !c.AddMetadataFromFilePath {
+			return 1
+		}
+
+		if c.Cache <= 0 {
+			return defaultCacheSize
+		}
+
+		return c.Cache
+	}
+
 	p := &Parser{
 		ParserOperator:          parserOperator,
 		format:                  c.Format,
 		addMetadataFromFilepath: c.AddMetadataFromFilePath,
+		cache:                   newCache(cacheSize()),
 	}
 	var cLogEmitter helper.LogEmitter
 	if metadata.StanzaSynchronousLogEmitterFeatureGate.IsEnabled() {
@@ -132,4 +151,14 @@ func createRecombineConfig(c Config) *recombine.Config {
 	recombineParserCfg.MaxUnmatchedBatchSize = 0
 
 	return recombineParserCfg
+}
+
+// Always creates a cache, if size is invalid it creates a minimal cache
+func newCache(size int) *lru.Cache[string, map[string]any] {
+	if size <= 0 {
+		size = 1
+	}
+	// lru will only return error when the size is less than 0
+	cache, _ := lru.New[string, map[string]any](size)
+	return cache
 }

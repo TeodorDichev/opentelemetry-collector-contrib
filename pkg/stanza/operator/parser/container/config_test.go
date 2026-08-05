@@ -89,6 +89,14 @@ func TestConfig(t *testing.T) {
 				}(),
 			},
 			{
+				Name: "filepath_cache_size",
+				Expect: func() *Config {
+					cfg := NewConfig()
+					cfg.Cache = 500
+					return cfg
+				}(),
+			},
+			{
 				Name: "parse_to_attributes",
 				Expect: func() *Config {
 					p := NewConfig()
@@ -119,4 +127,5 @@ func TestConfig(t *testing.T) {
 func TestDefaultValues(t *testing.T) {
 	cfg := NewConfig()
 	assert.Equal(t, helper.ByteSize(1024*1024), cfg.MaxLogSize)
+	assert.Equal(t, 4096, cfg.Cache)
 }

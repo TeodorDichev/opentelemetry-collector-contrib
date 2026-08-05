@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/goccy/go-json"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
@@ -60,6 +61,7 @@ var (
 // Parser is an operator that parses Container logs.
 type Parser struct {
 	helper.ParserOperator
+	cache                   *lru.Cache[string, map[string]any]
 	recombineParser         operator.Operator
 	format                  string
 	addMetadataFromFilepath bool
@@ -383,7 +385,7 @@ func (*Parser) handleMoveAttributes(e *entry.Entry) error {
 	return nil
 }
 
-// extractk8sMetaFromFilePath extracts metadata attributes from logfilePath
+// extractk8sMetaFromFilePath extracts metadata attributes from logfilePath and cache them
 func (p *Parser) extractk8sMetaFromFilePath(e *entry.Entry) error {
 	if !p.addMetadataFromFilepath {
 		return nil
@@ -402,9 +404,15 @@ func (p *Parser) extractk8sMetaFromFilePath(e *entry.Entry) error {
 		return fmt.Errorf("type '%T' cannot be parsed as log path field", logPath)
 	}
 
-	parsedValues, err := helper.MatchValues(rawLogPath, pathMatcher)
-	if err != nil {
-		return errors.New("failed to detect a valid log path")
+	var err error
+	parsedValues, ok := p.cache.Get(rawLogPath)
+	if !ok {
+		parsedValues, err = helper.MatchValues(rawLogPath, pathMatcher)
+		if err != nil {
+			return errors.New("failed to detect a valid log path")
+		}
+
+		p.cache.Add(rawLogPath, parsedValues)
 	}
 
 	for originalKey, attributeKey := range k8sMetadataMapping {

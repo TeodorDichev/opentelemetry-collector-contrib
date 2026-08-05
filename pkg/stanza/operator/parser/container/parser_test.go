@@ -1541,3 +1541,71 @@ func TestProcessBatchDockerQuietModeWithMixedEntries(t *testing.T) {
 		return len(entries) == 2
 	}))
 }
+
+func TestFilepathCachePopulatedOnFirstEntry(t *testing.T) {
+	cfg := NewConfigWithID("test_id")
+	cfg.AddMetadataFromFilePath = true
+	cfg.Cache = 100
+
+	set := componenttest.NewNopTelemetrySettings()
+	op, err := cfg.Build(set)
+	require.NoError(t, err)
+	p := op.(*Parser)
+
+	logPath := "/var/log/pods/default_mypod_49cc7c1fd3702c40b2686ea7486091d3/mycontainer/0.log"
+
+	e := entry.New()
+	e.Attributes = map[string]any{
+		attrs.LogFilePath: logPath,
+	}
+
+	// cache is empty before first call
+	_, ok := p.cache.Get(logPath)
+	require.False(t, ok, "cache should be empty before first extractk8sMetaFromFilePath call")
+
+	p.addMetadataFromFilepath = true
+	err = p.extractk8sMetaFromFilePath(e)
+	require.NoError(t, err)
+
+	// cache must be populated after first call
+	cached, ok := p.cache.Get(logPath)
+	require.True(t, ok, "cache should be populated after first extractk8sMetaFromFilePath call")
+	require.Equal(t, "default", cached["namespace"])
+	require.Equal(t, "mypod", cached["pod_name"])
+	require.Equal(t, "mycontainer", cached["container_name"])
+	require.Equal(t, "0", cached["restart_count"])
+}
+
+func TestFilepathCacheHitSkipsRegex(t *testing.T) {
+	cfg := NewConfigWithID("test_id")
+	cfg.AddMetadataFromFilePath = true
+	cfg.Cache = 100
+
+	set := componenttest.NewNopTelemetrySettings()
+	op, err := cfg.Build(set)
+	require.NoError(t, err)
+	p := op.(*Parser)
+
+	logPath := "/var/log/pods/default_mypod_49cc7c1fd3702c40b2686ea7486091d3/mycontainer/0.log"
+
+	// pre-populate the cache with sentinel values to prove the cache is read, not the regex
+	sentinel := map[string]any{
+		"namespace":      "cached-namespace",
+		"pod_name":       "cached-pod",
+		"container_name": "cached-container",
+		"restart_count":  "cached-restart",
+		"uid":            "cached-uid",
+	}
+	p.cache.Add(logPath, sentinel)
+
+	e := entry.New()
+	e.Attributes = map[string]any{attrs.LogFilePath: logPath}
+
+	err = p.extractk8sMetaFromFilePath(e)
+	require.NoError(t, err)
+
+	// resource attributes must come from the cache, not from the regex
+	require.Equal(t, "cached-namespace", e.Resource["k8s.namespace.name"])
+	require.Equal(t, "cached-pod", e.Resource["k8s.pod.name"])
+	require.Equal(t, "cached-container", e.Resource["k8s.container.name"])
+}
