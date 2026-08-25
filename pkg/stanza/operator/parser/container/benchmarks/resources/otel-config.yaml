@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otelcol-config
+data:
+  config.yaml: |
+    extensions:
+      pprof:
+        endpoint: 0.0.0.0:1777
+
+    receivers:
+      filelog:
+        include:
+          - /var/log/pods/*/*/*.log      
+        include_file_path: true
+        operators:
+          - type: container
+            add_metadata_from_filepath: true
+            filepath_cache_type: lru
+            disable_map_pools: false
+            use_regex: false
+
+    exporters:
+      debug:
+        verbosity: basic
+
+    service:
+      extensions: [pprof]
+      pipelines:
+        logs:
+          receivers: [filelog]
+          exporters: [debug]

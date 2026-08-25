@@ -4,9 +4,14 @@
 package container
 
 import (
+	"context"
 	"regexp"
 	"testing"
 
+	"go.opentelemetry.io/collector/component/componenttest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/entry"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/attrs"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator/helper"
 )
 
@@ -103,6 +108,68 @@ func BenchmarkLogPathParsing(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				_, _ = parseLogPath(bm.input)
 			}
+		})
+	}
+}
+
+// BenchmarkMapPools compares CRI parsing with and without sync.Pool map reuse.
+func BenchmarkMapPools(b *testing.B) {
+	for _, disabled := range []bool{false, true} {
+		name := "WithPools"
+		if disabled {
+			name = "WithoutPools"
+		}
+		b.Run(name, func(b *testing.B) {
+			cfg := NewConfigWithID("bench")
+			cfg.Format = containerdFormat
+			cfg.AddMetadataFromFilePath = false
+			cfg.DisableMapPools = disabled
+			set := componenttest.NewNopTelemetrySettings()
+			op, err := cfg.Build(set)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = op.Stop() })
+			p := op.(*Parser)
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_, _ = parseContainerd(benchContainerdLog)
+				_ = p // keep p alive so Build side-effects stay
+			}
+		})
+	}
+}
+
+// buildBenchParser creates a parser with the given cache type and stops it after the benchmark.
+func buildBenchParser(b *testing.B, cacheType string) *Parser {
+	b.Helper()
+	cfg := NewConfigWithID("bench")
+	cfg.Format = containerdFormat
+	cfg.AddMetadataFromFilePath = true
+	cfg.FilepathCacheType = cacheType
+	set := componenttest.NewNopTelemetrySettings()
+	op, err := cfg.Build(set)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = op.Stop() })
+	return op.(*Parser)
+}
+
+// BenchmarkCacheTypes compares the full containerd hot path across all cache configurations.
+func BenchmarkCacheTypes(b *testing.B) {
+	for _, ct := range []string{CacheTypeSyncMap, CacheTypeLRU, CacheTypeNone} {
+		b.Run(ct, func(b *testing.B) {
+			p := buildBenchParser(b, ct)
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					e := entry.New()
+					e.Body = benchContainerdLog
+					e.Attributes = map[string]any{attrs.LogFilePath: benchLogPath}
+					_ = p.Process(context.Background(), e)
+				}
+			})
 		})
 	}
 }

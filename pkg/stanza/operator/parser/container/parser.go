@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/goccy/go-json"
-	lru "github.com/hashicorp/golang-lru/v2"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
@@ -32,6 +32,17 @@ const (
 	logPathField        = attrs.LogFilePath
 	crioTimeLayout      = "2006-01-02T15:04:05.999999999Z07:00"
 	goTimeLayout        = "2006-01-02T15:04:05.999Z"
+
+	// original regex patterns — kept for benchmarking comparison via use_regex: true
+	crioPattern       = `^(?P<time>[^ Z]+) (?P<stream>stdout|stderr) (?P<logtag>[^ ]*) ?(?P<log>.*)$`
+	containerdPattern = `^(?P<time>[^ ^Z]+Z) (?P<stream>stdout|stderr) (?P<logtag>[^ ]*) ?(?P<log>.*)$`
+)
+
+var (
+	crioMatcher       = regexp.MustCompile(crioPattern)
+	containerdMatcher = regexp.MustCompile(containerdPattern)
+	// pathMatcher is used when use_regex: true to fall back to the original path regex.
+	pathMatcher = regexp.MustCompile(`^.*(\\/|\\)(?P<namespace>[^_]+)_(?P<pod_name>[^_]+)_(?P<uid>[a-f0-9\-]+)(\\/|\\)(?P<container_name>[^\._]+)(\\/|\\)(?P<restart_count>\d+)\.log(\.\d{8}-\d{6})?$`)
 )
 
 // Parser is an operator that parses Container logs.
@@ -44,22 +55,34 @@ type Parser struct {
 	recombineStarted        bool
 	recombineStartOnce      sync.Once
 	timeLayout              string
-	cache                   *lru.Cache[string, map[string]any]
+	cache                   helper.Cache
 }
 
 var (
-	// mapPool reuses maps to reduce allocations for CRI log line parsing.
+	// mapPool reduces GC pressure by reusing the 4-field map allocated per CRI log line
+	// (time, stream, logtag, log). These maps are short-lived — allocated in parseContainerd/parseCRIO,
+	// consumed by ParseWith/handleMoveAttributes, then eligible for reuse.
 	mapPool = sync.Pool{
 		New: func() any {
 			return make(map[string]any, 4)
 		},
 	}
-	// pathMapPool reuses maps for log path parsing.
+	// pathMapPool reduces GC pressure by reusing the 5-field map allocated per cache-miss
+	// in parseLogPath (k8s.namespace.name, k8s.pod.name, k8s.pod.uid, k8s.container.name,
+	// k8s.container.restart_count). On a cache hit no allocation occurs at all.
 	pathMapPool = sync.Pool{
 		New: func() any {
 			return make(map[string]any, 5)
 		},
 	}
+
+	// UseMapPools controls whether sync.Pool is used for map allocations.
+	// Set via disable_map_pools config field — false disables pooling for benchmarking.
+	UseMapPools = true
+
+	// UseRegexParsing forces CRI line parsing to use original regexes instead of the scanner.
+	// Set via use_regex config field.
+	UseRegexParsing = false
 )
 
 func (p *Parser) ProcessBatch(ctx context.Context, entries []*entry.Entry) error {
@@ -259,6 +282,9 @@ func (p *Parser) Process(ctx context.Context, entry *entry.Entry) (err error) {
 // Stop ensures that the internal recombineParser and criLogEmitter are stopped
 // in the proper order without being affected by any possible race conditions.
 func (p *Parser) Stop() error {
+	if p.cache != nil {
+		p.cache.Stop()
+	}
 	if !p.recombineStarted {
 		// nothing is started return
 		return nil
@@ -311,6 +337,10 @@ func parseContainerd(value any) (any, error) {
 		return "", fmt.Errorf("type '%T' cannot be parsed as container logs", value)
 	}
 
+	if UseRegexParsing {
+		return helper.MatchValues(raw, containerdMatcher)
+	}
+
 	timePart, rest, ok := splitFirstOnInterval(raw)
 	if !ok || !strings.HasSuffix(timePart, "Z") {
 		return nil, errors.New("could not parse containerd fields")
@@ -331,9 +361,14 @@ func parseContainerd(value any) (any, error) {
 		logPart = ""
 	}
 
-	m := mapPool.Get().(map[string]any)
-	for k := range m {
-		delete(m, k)
+	var m map[string]any
+	if UseMapPools {
+		m = mapPool.Get().(map[string]any)
+		for k := range m {
+			delete(m, k)
+		}
+	} else {
+		m = make(map[string]any, 4)
 	}
 	m["time"] = timePart
 	m["stream"] = stream
@@ -346,6 +381,10 @@ func parseCRIO(value any) (any, error) {
 	raw, ok := value.(string)
 	if !ok {
 		return "", fmt.Errorf("type '%T' cannot be parsed as container logs", value)
+	}
+
+	if UseRegexParsing {
+		return helper.MatchValues(raw, crioMatcher)
 	}
 
 	timePart, rest, ok := splitFirstOnInterval(raw)
@@ -364,11 +403,14 @@ func parseCRIO(value any) (any, error) {
 		logPart = ""
 	}
 
-	// Use pool to reduce allocations
-	m := mapPool.Get().(map[string]any)
-	// Clear the map in case it was reused
-	for k := range m {
-		delete(m, k)
+	var m map[string]any
+	if UseMapPools {
+		m = mapPool.Get().(map[string]any)
+		for k := range m {
+			delete(m, k)
+		}
+	} else {
+		m = make(map[string]any, 4)
 	}
 	m["time"] = timePart
 	m["stream"] = stream
@@ -441,9 +483,22 @@ func (p *Parser) extractk8sMetaFromFilePath(e *entry.Entry) error {
 
 	var parsedValues map[string]any
 	if p.cache != nil {
-		if parsedValues, ok = p.cache.Get(rawLogPath); ok {
-			return p.setK8sMetadataFromParsedValues(e, parsedValues)
+		if cached := p.cache.Get(rawLogPath); cached != nil {
+			if parsedValues, ok = cached.(map[string]any); ok {
+				return p.setK8sMetadataFromParsedValues(e, parsedValues)
+			}
 		}
+	}
+
+	if UseRegexParsing {
+		parsedValues, err := helper.MatchValues(rawLogPath, pathMatcher)
+		if err != nil {
+			return errors.New("failed to detect a valid log path")
+		}
+		if p.cache != nil {
+			p.cache.Add(rawLogPath, parsedValues)
+		}
+		return p.setK8sMetadataFromParsedValues(e, parsedValues)
 	}
 
 	parsedValues, ok = parseLogPath(rawLogPath)
@@ -631,9 +686,14 @@ func parseLogPath(raw string) (map[string]any, bool) {
 		return nil, false
 	}
 
-	m := pathMapPool.Get().(map[string]any)
-	for k := range m {
-		delete(m, k)
+	var m map[string]any
+	if UseMapPools {
+		m = pathMapPool.Get().(map[string]any)
+		for k := range m {
+			delete(m, k)
+		}
+	} else {
+		m = make(map[string]any, 5)
 	}
 	m["k8s.namespace.name"] = ns
 	m["k8s.pod.name"] = pod
@@ -644,13 +704,10 @@ func parseLogPath(raw string) (map[string]any, bool) {
 	return m, true
 }
 
-// splitFirstOn splits s on the first occurrence of sep.
+// splitFirstOnInterval splits s on the first space.
 func splitFirstOnInterval(s string) (head, tail string, ok bool) {
-	idx := strings.IndexByte(s, ' ')
-	if idx == -1 {
-		return "", "", false
-	}
-	return s[:idx], s[idx+1:], true
+	head, tail, ok = strings.Cut(s, " ")
+	return
 }
 
 // isNamespace matches [^_]+ from the regex — any char except underscore, one or more.

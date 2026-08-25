@@ -27,6 +27,7 @@ func newTestParser(t *testing.T) *Parser {
 	set := componenttest.NewNopTelemetrySettings()
 	op, err := config.Build(set)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = op.Stop() })
 	return op.(*Parser)
 }
 
@@ -1529,23 +1530,24 @@ func TestFilepathCachePopulatedOnFirstEntry(t *testing.T) {
 	set := componenttest.NewNopTelemetrySettings()
 	op, err := cfg.Build(set)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = op.Stop() })
 	p := op.(*Parser)
 
 	e := entry.New()
 	e.Attributes = map[string]any{attrs.LogFilePath: testLogPath}
 
-	_, ok := p.cache.Get(testLogPath)
-	require.False(t, ok, "cache should be empty before first call")
+	require.Nil(t, p.cache.Get(testLogPath), "cache should be empty before first call")
 
 	err = p.extractk8sMetaFromFilePath(e)
 	require.NoError(t, err)
 
-	cached, ok := p.cache.Get(testLogPath)
-	require.True(t, ok, "cache should be populated after first call")
-	require.Equal(t, "default", cached["k8s.namespace.name"])
-	require.Equal(t, "mypod", cached["k8s.pod.name"])
-	require.Equal(t, "mycontainer", cached["k8s.container.name"])
-	require.Equal(t, "0", cached["k8s.container.restart_count"])
+	cached := p.cache.Get(testLogPath)
+	require.NotNil(t, cached, "cache should be populated after first call")
+	m := cached.(map[string]any)
+	require.Equal(t, "default", m["k8s.namespace.name"])
+	require.Equal(t, "mypod", m["k8s.pod.name"])
+	require.Equal(t, "mycontainer", m["k8s.container.name"])
+	require.Equal(t, "0", m["k8s.container.restart_count"])
 }
 
 func TestFilepathCacheHitSkipsRegex(t *testing.T) {
@@ -1556,6 +1558,7 @@ func TestFilepathCacheHitSkipsRegex(t *testing.T) {
 	set := componenttest.NewNopTelemetrySettings()
 	op, err := cfg.Build(set)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = op.Stop() })
 	p := op.(*Parser)
 
 	sentinel := map[string]any{
@@ -1586,6 +1589,7 @@ func TestFilepathCacheDisabledWhenMetadataOff(t *testing.T) {
 	set := componenttest.NewNopTelemetrySettings()
 	op, err := cfg.Build(set)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = op.Stop() })
 	p := op.(*Parser)
 
 	e := entry.New()

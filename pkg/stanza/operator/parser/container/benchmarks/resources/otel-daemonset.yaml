@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otelcol
+spec:
+  selector:
+    matchLabels:
+      app: otelcol
+  template:
+    metadata:
+      labels:
+        app: otelcol
+    spec:
+      containers:
+        - name: otelcol
+          image: otel/opentelemetry-collector-contrib:0.157.0
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: otelcol-config
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods

@@ -25,6 +25,14 @@ const (
 	recombineIsLastEntry      = "attributes.logtag == 'F'"
 	defaultMaxLogSize         = 1024 * 1024
 	defaultPathCacheSize      = 1024
+
+	// CacheTypeNone disables the k8s metadata path cache — the path is re-parsed on every log line.
+	CacheTypeNone = "none"
+	// CacheTypeSyncMap uses helper.SyncMapCache (sync.Map + FIFO eviction) — lock-free concurrent reads (default).
+	// This is the cache implementation from PR #44487.
+	CacheTypeSyncMap = "syncmap"
+	// CacheTypeLRU uses hashicorp/golang-lru/v2 for the path cache — bounded LRU eviction.
+	CacheTypeLRU = "lru"
 )
 
 func init() {
@@ -53,6 +61,25 @@ type Config struct {
 	Format                  string          `mapstructure:"format"`
 	AddMetadataFromFilePath bool            `mapstructure:"add_metadata_from_filepath"`
 	MaxLogSize              helper.ByteSize `mapstructure:"max_log_size,omitempty"`
+
+	// FilepathCacheType selects the cache used to store parsed k8s metadata
+	// (namespace, pod name, uid, container name, restart count) keyed by log file path.
+	// The cache avoids re-parsing the path on every log line; one entry per unique path.
+	//   - "" or "syncmap" (default): helper.SyncMapCache — sync.Map + FIFO eviction (from PR #44487)
+	//   - "lru": LRU eviction via hashicorp/golang-lru — bounded memory under high pod churn
+	//   - "none": no cache — path is re-parsed on every log line (use to profile cache impact)
+	FilepathCacheType string `mapstructure:"filepath_cache_type,omitempty"`
+
+	// DisableMapPools disables sync.Pool reuse for the short-lived maps allocated
+	// during CRI line and log path parsing. Pools reduce GC pressure by reusing
+	// already-allocated map objects rather than allocating new ones per log line.
+	// Set to true to measure allocation cost without pooling.
+	DisableMapPools bool `mapstructure:"disable_map_pools,omitempty"`
+
+	// UseRegex forces CRI line parsing (containerd and crio formats) to use the
+	// original regex-based approach instead of the hand-written scanner.
+	// Set to true to profile the scanner improvement vs the original regex.
+	UseRegex bool `mapstructure:"use_regex,omitempty"`
 }
 
 // Build will build a Container parser operator.
@@ -74,12 +101,19 @@ func (c Config) Build(set component.TelemetrySettings) (operator.Operator, error
 		}
 	}
 
+	pathCache, err := buildCache(c)
+	if err != nil {
+		return nil, err
+	}
+
 	p := &Parser{
 		ParserOperator:          parserOperator,
 		format:                  c.Format,
 		addMetadataFromFilepath: c.AddMetadataFromFilePath,
-		cache:                   newCacheOrNil(defaultPathCacheSize, c.AddMetadataFromFilePath),
+		cache:                   pathCache,
 	}
+	UseMapPools = !c.DisableMapPools
+	UseRegexParsing = c.UseRegex
 	var cLogEmitter helper.LogEmitter
 	if metadata.StanzaSynchronousLogEmitterFeatureGate.IsEnabled() {
 		cLogEmitter = helper.NewSynchronousLogEmitter(set, p.consumeEntries)
@@ -98,6 +132,26 @@ func (c Config) Build(set component.TelemetrySettings) (operator.Operator, error
 	return p, nil
 }
 
+// buildCache returns a helper.Cache for filepath metadata, or nil when caching is disabled.
+func buildCache(c Config) (helper.Cache, error) {
+	if !c.AddMetadataFromFilePath {
+		return nil, nil
+	}
+
+	switch c.FilepathCacheType {
+	case CacheTypeNone:
+		return nil, nil
+	case CacheTypeLRU:
+		lruCache, _ := lru.New[string, any](defaultPathCacheSize)
+		return &lruCacheAdapter{cache: lruCache}, nil
+	case CacheTypeSyncMap, "":
+		return helper.NewSyncMapCache(defaultPathCacheSize, 0), nil
+	default:
+		return nil, fmt.Errorf("invalid filepath_cache_type %q: must be one of %q, %q, %q",
+			c.FilepathCacheType, CacheTypeSyncMap, CacheTypeLRU, CacheTypeNone)
+	}
+}
+
 // createRecombine creates an internal recombine operator which outputs to an async helper.LogEmitter
 // the equivalent recombine config:
 //
@@ -114,7 +168,6 @@ func createRecombine(set component.TelemetrySettings, c Config, cLogEmitter help
 		return nil, fmt.Errorf("failed to resolve internal recombine config: %w", err)
 	}
 
-	// set the LogEmmiter as the output of the recombine parser
 	recombineParser.SetOutputIDs([]string{cLogEmitter.ID()})
 	if err := recombineParser.SetOutputs([]operator.Operator{cLogEmitter}); err != nil {
 		return nil, errors.New("failed to set outputs of internal recombine")
@@ -130,23 +183,42 @@ func createRecombineConfig(c Config) *recombine.Config {
 	recombineParserCfg.CombineWith = ""
 	recombineParserCfg.SourceIdentifier = entry.NewAttributeField(recombineSourceIdentifier)
 	recombineParserCfg.MaxLogSize = c.MaxLogSize
-	// Set batch sizes to 0 (unlimited) - rely on max_log_size for protection
 	recombineParserCfg.MaxBatchSize = 0
 	recombineParserCfg.MaxUnmatchedBatchSize = 0
 
 	return recombineParserCfg
 }
 
-// creates cache with given size or returns nil depending on the boolean argument
-func newCacheOrNil(size int, shouldCreate bool) *lru.Cache[string, map[string]any] {
-	if !shouldCreate {
+// lruCacheAdapter wraps hashicorp/golang-lru to implement helper.Cache.
+type lruCacheAdapter struct {
+	cache *lru.Cache[string, any]
+}
+
+func (a *lruCacheAdapter) Get(key string) any {
+	val, ok := a.cache.Get(key)
+	if !ok {
 		return nil
 	}
-
-	if size <= 0 {
-		size = defaultPathCacheSize
-	}
-	// lru will only return error when the size is less than 0
-	cache, _ := lru.New[string, map[string]any](size)
-	return cache
+	return val
 }
+
+func (a *lruCacheAdapter) Add(key string, data any) bool {
+	return a.cache.Add(key, data)
+}
+
+func (a *lruCacheAdapter) Copy() map[string]any {
+	keys := a.cache.Keys()
+	m := make(map[string]any, len(keys))
+	for _, k := range keys {
+		if v, ok := a.cache.Get(k); ok {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+func (a *lruCacheAdapter) MaxSize() uint16 {
+	return uint16(a.cache.Len())
+}
+
+func (a *lruCacheAdapter) Stop() {}
