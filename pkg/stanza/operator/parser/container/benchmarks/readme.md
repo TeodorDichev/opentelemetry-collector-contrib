@@ -117,8 +117,9 @@ Also using the collect.sh script:
 |---|---|---|
 |Log records ingested during 30s | 4 056 376 | 12 574 969 | 
 |Throughput records/sec | 135 212 | 419 165 |
-Average increase is aroud 30 times, which will scale even further when there are more pods and container to collect more logs from.
 
+
+Average increase is aroud 30 times, which will scale even further when there are more pods and container to collect more logs from.
 **Conclusion:** All regex CPU is eliminated. The remaining profile is dominated entirely by Go runtime GC — `mallocgcSmallScanNoHeader`, `scanObjectsSmall`, `mallocgc` — which is the theoretical floor for any Go program doing this volume of map allocations. There is no container-parser-specific work left in the top functions.
 
 ---
@@ -145,7 +146,7 @@ LRU handles this correctly: when the cache is full, the least-recently-used path
 
 ## Micro-benchmarks (Apple M5 Pro, Go 1.24, 5s)
 
-Here the numbers dffer each time, however the percentage difference stays the same
+Here the numbers differ each time, however the percentage difference stays the same
 
 ### CRI line parsing: scanner vs regex
 
