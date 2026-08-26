@@ -141,10 +141,10 @@ func buildCache(c Config) (helper.Cache, error) {
 	switch c.FilepathCacheType {
 	case CacheTypeNone:
 		return nil, nil
-	case CacheTypeLRU:
+	case CacheTypeLRU, "":
 		lruCache, _ := lru.New[string, any](defaultPathCacheSize)
 		return &lruCacheAdapter{cache: lruCache}, nil
-	case CacheTypeSyncMap, "":
+	case CacheTypeSyncMap:
 		return helper.NewSyncMapCache(defaultPathCacheSize, 0), nil
 	default:
 		return nil, fmt.Errorf("invalid filepath_cache_type %q: must be one of %q, %q, %q",
@@ -189,7 +189,7 @@ func createRecombineConfig(c Config) *recombine.Config {
 	return recombineParserCfg
 }
 
-// lruCacheAdapter wraps hashicorp/golang-lru to implement helper.Cache.
+// lruCacheAdapter wraps hashicorp/golang-lru to implement helper.Cache. so its easier to test
 type lruCacheAdapter struct {
 	cache *lru.Cache[string, any]
 }

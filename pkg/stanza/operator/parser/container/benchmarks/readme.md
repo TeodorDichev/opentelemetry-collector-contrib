@@ -9,7 +9,7 @@ Three independent knobs — all settable from the collector YAML, no rebuild nee
 | Config field | Values | What it controls |
 |---|---|---|
 | `use_regex` | `false` (default), `true` | CRI + path metadata: hand-written scanner vs original regex |
-| `filepath_cache_type` | `syncmap` (default), `lru`, `none` | Cache for parsed k8s path metadata |
+| `filepath_cache_type` | `syncmap`, `lru` (default), `none` | Cache for parsed k8s path metadata |
 | `disable_map_pools` | `false` (default), `true` | `sync.Pool` reuse for short-lived parse maps |
 
 Example — full baseline (everything as it was before this PR):
@@ -123,7 +123,7 @@ The path metadata cache stores `log.file.path → k8s metadata` entries. The acc
 - **Read millions of times** for the lifetime of that file
 - **Stale entries** accumulate as pods die and restart (old paths are never explicitly evicted)
 
-LRU handles this correctly: when the cache is full, the least-recently-used path is evicted. Dead pod paths naturally fall to the bottom of the LRU queue since they stop receiving reads, so they're the first to go when space is needed. The syncmap implementation uses a FIFO channel for eviction — it evicts the oldest-inserted entry regardless of access frequency, which could evict an actively-used path if it was inserted early.
+LRU handles this correctly: when the cache is full, the least-recently-used path is evicted. Dead pod paths naturally fall to the bottom of the LRU queue since they stop receiving reads, so they're the first to go when space is needed. The syncmap implementation uses a FIFO channel for eviction — it evicts the oldest-inserted entry regardless of access frequency, which could evict an actively-used path if it was inserted early. But the main advantage of the lru cache it the fact its less API to manage.
 
 **Why not other libraries?**
 
@@ -138,29 +138,31 @@ LRU handles this correctly: when the cache is full, the least-recently-used path
 
 ## Micro-benchmarks (Apple M5 Pro, Go 1.24, 5s)
 
+Here the numbers dffer each time, however the percentage difference stays the same
+
 ### CRI line parsing: scanner vs regex
 
 ```
-BenchmarkContainerdCRIParsing/Regex/Containerd     587 ns/op   564 B/op   8 allocs/op
-BenchmarkContainerdCRIParsing/NoRegex/Containerd   175 ns/op   416 B/op   7 allocs/op  (~3.4×)
+BenchmarkContainerdCRIParsing/Regex/Containerd     538 ns/op   564 B/op   8 allocs/op
+BenchmarkContainerdCRIParsing/NoRegex/Containerd   160 ns/op   416 B/op   7 allocs/op  (~3.4×)
 
-BenchmarkCRIOParsing/Regex/CRIO     653 ns/op   564 B/op   8 allocs/op
-BenchmarkCRIOParsing/NoRegex/CRIO   167 ns/op   416 B/op   7 allocs/op  (~3.9×)
+BenchmarkCRIOParsing/Regex/CRIO     603 ns/op   564 B/op   8 allocs/op
+BenchmarkCRIOParsing/NoRegex/CRIO   158 ns/op   416 B/op   7 allocs/op  (~3.9×)
 ```
 
 ### Log path parsing: scanner vs regex
 
 ```
-BenchmarkLogPathParsing/Regex/Standard    1856 ns/op   739 B/op   9 allocs/op
-BenchmarkLogPathParsing/NoRegex/Standard   235 ns/op   416 B/op   7 allocs/op  (~7.9×)
+BenchmarkLogPathParsing/Regex/Standard    1750 ns/op   739 B/op   9 allocs/op
+BenchmarkLogPathParsing/NoRegex/Standard   210 ns/op   416 B/op   7 allocs/op  (~7.9×)
 ```
 
-### Full hot path — cache type comparison
+### Cache type comparison
 
 ```
-BenchmarkCacheTypes/syncmap   1386 ns/op   2043 B/op   43 allocs/op
-BenchmarkCacheTypes/lru       1365 ns/op   2043 B/op   43 allocs/op
-BenchmarkCacheTypes/none      1526 ns/op   2128 B/op   48 allocs/op  (+10%)
+BenchmarkCacheTypes/syncmap   1220 ns/op   2043 B/op   43 allocs/op
+BenchmarkCacheTypes/lru       1225 ns/op   2043 B/op   43 allocs/op
+BenchmarkCacheTypes/none      1400 ns/op   2128 B/op   48 allocs/op  (+10%)
 ```
 
 ---
