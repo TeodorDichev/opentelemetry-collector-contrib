@@ -1,10 +1,10 @@
 # Container Parser Benchmarks
 
-Performance analysis for the optimisations in `pkg/stanza/operator/parser/container`.
+Performance analysis for the optimisations in `pkg/stanza/operator/parser/container` showing the impact of this [PR](https://github.com/open-telemetry/opentelemetry-collector-contrib/pull/50087)
 
 ## What is configurable
 
-Three independent knobs — all settable from the collector YAML, no rebuild needed:
+In order to make testing easier I added a few options to the configurations and used them to enable the features I want to implement. There are three independent knobs - all settable from the collector YAML:
 
 | Config field | Values | What it controls |
 |---|---|---|
@@ -12,7 +12,6 @@ Three independent knobs — all settable from the collector YAML, no rebuild nee
 | `filepath_cache_type` | `syncmap`, `lru` (default), `none` | Cache for parsed k8s path metadata |
 | `disable_map_pools` | `false` (default), `true` | `sync.Pool` reuse for short-lived parse maps |
 
-Example — full baseline (everything as it was before this PR):
 ```yaml
 operators:
   - type: container
@@ -21,6 +20,22 @@ operators:
     disable_map_pools: true
     use_regex: true
 ```
+
+There is also this script `./pkg/stanza/operator/parser/container/benchmarks/resources/collect.sh` which uses the metrics endpoint of the collector to get the number of accepted logs, s well as the pprof profile.
+
+## Flame graphs
+
+First, lets explore the flamegraphs before any changes and the final version I want merged. If we zoom in we can see how massive are the regexes.
+
+**Before — `regex_nocache_nomap` (true baseline: all regexes, no cache, no pools)**
+
+![Baseline flame graph](resources/reg_nocache_nomap_flamegraph.png)
+
+**After — `noregex_lru_map` (scanner + LRU cache + pools)**
+
+![Optimised flame graph](resources/noreg_lru_map_flamegrapg.png)
+
+> To view top10 for any profile: `go tool pprof -top <file>.pprof`
 
 ---
 
@@ -34,21 +49,7 @@ operators:
 | `noregex_syncmap_nomap.pprof` | `false` | `syncmap` | `true` |
 | `noregex_lru_map.pprof` | `false` | `lru` | `false` |
 
-All profiles: 30-second CPU sample, kind cluster, single log-spammer pod writing containerd-format lines.
-
-> To view top10 for any profile: `go tool pprof -top <file>.pprof`
-
----
-
-## Flame graphs
-
-**Before — `regex_nocache_nomap` (true baseline: all regexes, no cache, no pools)**
-
-![Baseline flame graph](resources/reg_nocache_nomap_flamegraph.png)
-
-**After — `noregex_lru_map` (scanner + LRU cache + pools)**
-
-![Optimised flame graph](resources/noreg_lru_map_flamegrapg.png)
+All profiles are 30-second CPU samples which are executed against a kind cluster with single log-spammer pod writing containerd-format lines.
 
 ---
 
@@ -56,6 +57,7 @@ All profiles: 30-second CPU sample, kind cluster, single log-spammer pod writing
 
 ### 1. Scanner vs regex — isolating the scanner gain
 
+First, lets replace the regex with a custom written parser. Despite being less readable (as a code) This makes the code much faster.
 `regex_nocache_nomap` → `noregex_nocache_nomap` (same: no cache, no pools)
 
 ```
@@ -66,11 +68,13 @@ All profiles: 30-second CPU sample, kind cluster, single log-spammer pod writing
     +1.77s  4.87%   runtime.scanObjectsSmall
 ```
 
-**Conclusion:** The scanner eliminates 16.80s of cumulative regex CPU — 46% of the entire baseline sample. All `regexp.*` functions vanish completely. GC rises slightly because the collector is now processing more log lines per second (higher throughput means more allocations), not because the scanner is less efficient.
+**Conclusion:** The scanner eliminates 16.80s of cumulative regex CPU - 46% of the entire baseline sample. All `regexp.*` functions vanish completely. GC rises slightly because the collector is now processing more log lines per second (higher throughput means more allocations), not because the scanner is less efficient.
 
 ---
 
 ### 2. LRU cache vs syncmap cache — isolating the cache implementation
+
+Next was the decision what type of cache to use for the k8s attributes path metadata. The PR mentioned in the description uses a sync map to cache the data. Here we compare a similar approach with a lru cache which I believe its better since that is less code to support in the future. A whole paragraph at the bottom is dedicated to explaining why I have chosed this cache.
 
 `noregex_lru_nomap` → `noregex_syncmap_nomap` (same: scanner, no pools)
 
@@ -86,6 +90,8 @@ All profiles: 30-second CPU sample, kind cluster, single log-spammer pod writing
 ---
 
 ### 3. Map pools on vs off — isolating the pool benefit
+
+The last change is adding a map cache. During testing I noticed that there was a lot of GC pressure and a lot of maps being created. Therefore, I tried to address that by adding a pool for maps so they can be reused.
 
 `noregex_lru_nomap` → `noregex_lru_map` (same: scanner, LRU cache)
 
@@ -112,7 +118,7 @@ All profiles: 30-second CPU sample, kind cluster, single log-spammer pod writing
     +1.44s  3.96%   runtime.scanObjectsSmall
 ```
 
-Also using the collect.sh script: 
+Also using the collect.sh script described in the beginning: 
 | action | `regex_nocache_nomap` | `noregex_lru_map` |
 |---|---|---|
 |Log records ingested during 30s | 4 056 376 | 12 574 969 | 
@@ -121,26 +127,6 @@ Also using the collect.sh script:
 
 Average increase is aroud 30 times, which will scale even further when there are more pods and container to collect more logs from.
 **Conclusion:** All regex CPU is eliminated. The remaining profile is dominated entirely by Go runtime GC — `mallocgcSmallScanNoHeader`, `scanObjectsSmall`, `mallocgc` — which is the theoretical floor for any Go program doing this volume of map allocations. There is no container-parser-specific work left in the top functions.
-
----
-
-## Why LRU is the right cache choice
-
-The path metadata cache stores `log.file.path → k8s metadata` entries. The access pattern is:
-- **Write once** per unique file path (when a container starts)
-- **Read millions of times** for the lifetime of that file
-- **Stale entries** accumulate as pods die and restart (old paths are never explicitly evicted)
-
-LRU handles this correctly: when the cache is full, the least-recently-used path is evicted. Dead pod paths naturally fall to the bottom of the LRU queue since they stop receiving reads, so they're the first to go when space is needed. The syncmap implementation uses a FIFO channel for eviction — it evicts the oldest-inserted entry regardless of access frequency, which could evict an actively-used path if it was inserted early. But the main advantage of the lru cache it the fact its less API to manage.
-
-**Why not other libraries?**
-
-| Library | Notes |
-|---|---|
-| `github.com/hashicorp/golang-lru/v2` | Chosen — already in the contrib repo's dependency tree, generic typed API, thread-safe, well-maintained |
-| `github.com/patrickmn/go-cache` | TTL-based, not LRU — wrong eviction model for this use case (paths don't expire on a timer) |
-| `github.com/dgraph-io/ristretto` | High-performance but adds a large dependency for a simple bounded cache |
-| `sync.Map` (helper.SyncMapCache) | FIFO eviction, more code to maintain internally |
 
 ---
 
@@ -172,6 +158,26 @@ BenchmarkCacheTypes/syncmap   1220 ns/op   2043 B/op   43 allocs/op
 BenchmarkCacheTypes/lru       1225 ns/op   2043 B/op   43 allocs/op
 BenchmarkCacheTypes/none      1400 ns/op   2128 B/op   48 allocs/op  (+10%)
 ```
+
+---
+
+## Why LRU is the right cache choice
+
+The path metadata cache stores `log.file.path → k8s metadata` entries. The access pattern is:
+- **Write once** per unique file path (when a container starts)
+- **Read millions of times** for the lifetime of that file
+- **Stale entries** accumulate as pods die and restart (old paths are never explicitly evicted)
+
+LRU handles this correctly: when the cache is full, the least-recently-used path is evicted. Dead pod paths naturally fall to the bottom of the LRU queue since they stop receiving reads, so they're the first to go when space is needed. The syncmap implementation uses a FIFO channel for eviction — it evicts the oldest-inserted entry regardless of access frequency, which could evict an actively-used path if it was inserted early. But the main advantage of the lru cache it the fact its less API to manage.
+
+**Why not other libraries?**
+
+| Library | Notes |
+|---|---|
+| `github.com/hashicorp/golang-lru/v2` | Chosen — already in the contrib repo's dependency tree, generic typed API, thread-safe, well-maintained |
+| `github.com/patrickmn/go-cache` | TTL-based, not LRU — wrong eviction model for this use case (paths don't expire on a timer) |
+| `github.com/dgraph-io/ristretto` | High-performance but adds a large dependency for a simple bounded cache |
+| `sync.Map` (helper.SyncMapCache) | FIFO eviction, more code to maintain internally |
 
 ---
 
