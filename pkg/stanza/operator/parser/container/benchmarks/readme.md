@@ -104,25 +104,44 @@ The last change is adding a map cache. During testing I noticed that there was a
 
 **Conclusion:** Pools provide a small but consistent reduction in GC-related work (~0.4s across several functions). The numbers are modest in isolation but at the scale of a production node handling tens of thousands of log lines per second, the reduction in map allocations compounds. Pools are cheap to keep.
 
+There was an issue with the pools. In the current branch they differ from the PR. The problem was they were not getting `Put` on time. If you want to explore their profile please check out latest.pprof
+Here is the result from -diff_base=noregex_lru_map.pprof latest.pprof
+```
+Showing nodes accounting for -0.96s, 2.29% of 41.91s total
+Showing top 10 nodes out of 644
+      flat  flat%   sum%        cum   cum%
+     0.45s  1.07%  1.07%      0.38s  0.91%  internal/runtime/maps.(*Iter).Next
+    -0.42s  1.00% 0.072%     -0.43s  1.03%  time.nextStdChunk
+    -0.35s  0.84%  0.76%     -0.35s  0.84%  runtime.mallocgcSmallScanNoHeader
+    -0.35s  0.84%  1.60%     -1.19s  2.84%  time.parse
+     0.30s  0.72%  0.88%      0.08s  0.19%  runtime.scanObjectsSmall
+    -0.21s   0.5%  1.38%     -0.21s   0.5%  golang.org/x/text/encoding/unicode.utf8Decoder.Transform
+    -0.20s  0.48%  1.86%     -0.20s  0.48%  runtime.memmove
+     0.19s  0.45%  1.41%      0.21s   0.5%  internal/runtime/maps.(*Map).deleteSmall
+    -0.19s  0.45%  1.86%     -0.19s  0.45%  sync.(*poolChain).popTail
+    -0.18s  0.43%  2.29%     -0.18s  0.43%  internal/runtime/syscall/linux.Syscall6
+```
+
 ---
 
 ### 4. Full optimisation vs baseline
 
-`regex_nocache_nomap` → `noregex_lru_map` (scanner + LRU + pools)
+`regex_nocache_nomap` → `latest` (scanner + LRU + pools)
 
 ```
    -10.09s 27.74%   regexp.(*Regexp).tryBacktrack       cum: -16.80s (-46.2%)
     -3.77s 10.37%   regexp.(*bitState).shouldVisit
     -1.40s  3.85%   regexp.(*inputString).step
-    +1.64s  4.51%   runtime.mallocgcSmallScanNoHeader   ← throughput increase
-    +1.44s  3.96%   runtime.scanObjectsSmall
+    -0.78s  2.14%   regexp.(*bitState).push
+    +1.27s  3.49%   runtime.mallocgcSmallScanNoHeader   ← throughput increase
+    +1.20s  3.30%   internal/runtime/maps.(*Iter).Next
 ```
 
 Also using the collect.sh script described in the beginning: 
-| action | `regex_nocache_nomap` | `noregex_lru_map` |
-|---|---|---|
-|Log records ingested during 30s | 4 056 376 | 12 574 969 | 
-|Throughput records/sec | 135 212 | 419 165 |
+| action | `regex_nocache_nomap` | `noregex_lru_map` | `latest` |
+|---|---|---|---|
+|Log records ingested during 30s | 4 056 376 | 12 574 969 | 14 248 063 |
+|Throughput records/sec | 135 212 | 419 165 | 474 935 |
 
 
 Average increase is aroud 30 times, which will scale even further when there are more pods and container to collect more logs from.
@@ -184,6 +203,14 @@ LRU handles this correctly: when the cache is full, the least-recently-used path
 ## Collecting pprof from kind
 
 ### Build and deploy (once, or after code changes)
+
+Create a local kind cluster
+
+Create a noisy pod:
+```
+kubectl run log-spammer --image=busybox --restart=Always -- \
+    sh -c 'while true; do printf "2024-01-15T10:30:00.000000000Z stdout F test log line\n"; done'
+```	
 
 ```bash
 # Build for linux/arm64
